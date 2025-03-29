@@ -3,7 +3,8 @@ import logging
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler, ConversationHandler
-from places_api import get_nearby_places, get_place_details
+from yandex_api import get_nearby_places, get_place_details, get_static_map_url, get_route_url
+from perplexity_api import get_place_description, get_excursion_info, get_place_reviews
 from geopy.distance import geodesic
 
 # Загружаем переменные окружения
@@ -222,18 +223,21 @@ def place_selection_handler(update: Update, context: CallbackContext) -> int:
     ).meters
     
     address = place_details.get("formatted_address", "Адрес недоступен")
-    rating = place_details.get("rating", "Нет оценок")
+    
+    # Получаем описание с помощью Perplexity API
+    place_description = get_place_description(place_details['name'], address)
     
     place_info = (
         f"📍 <b>{place_details['name']}</b>\n\n"
         f"📏 Расстояние: {int(distance)} метров\n"
-        f"🏠 Адрес: {address}\n"
-        f"⭐ Рейтинг: {rating}\n\n"
+        f"🏠 Адрес: {address}\n\n"
+        f"{place_description}\n"
     )
     
     if "photos" in place_details:
-        photo_reference = place_details["photos"][0]["photo_reference"]
-        photo_url = f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=600&photoreference={photo_reference}&key={os.getenv('GOOGLE_PLACES_API_KEY')}"
+        # Используем статическую карту Яндекса
+        photo_coords = place_details["photos"][0]["photo_reference"].split(",")
+        photo_url = get_static_map_url(photo_coords[0], photo_coords[1])
         
         # Отправляем фото и информацию
         context.bot.send_photo(
@@ -244,6 +248,7 @@ def place_selection_handler(update: Update, context: CallbackContext) -> int:
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Проложить маршрут", callback_data=f"route_{place_index}")],
                 [InlineKeyboardButton("Мини-экскурсия", callback_data=f"excursion_{place_index}")],
+                [InlineKeyboardButton("Отзывы", callback_data=f"reviews_{place_index}")],
                 [InlineKeyboardButton("Выбрать другое место", callback_data="back_to_places")]
             ])
         )
@@ -255,6 +260,7 @@ def place_selection_handler(update: Update, context: CallbackContext) -> int:
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Проложить маршрут", callback_data=f"route_{place_index}")],
                 [InlineKeyboardButton("Мини-экскурсия", callback_data=f"excursion_{place_index}")],
+                [InlineKeyboardButton("Отзывы", callback_data=f"reviews_{place_index}")],
                 [InlineKeyboardButton("Выбрать другое место", callback_data="back_to_places")]
             ])
         )
@@ -273,16 +279,16 @@ def route_handler(update: Update, context: CallbackContext) -> int:
     user_location = user_data_store[user_id]["location"]
     place_location = selected_place["geometry"]["location"]
     
-    # Формируем ссылку на Google Maps
-    maps_url = (
-        f"https://www.google.com/maps/dir/?api=1"
-        f"&origin={user_location['latitude']},{user_location['longitude']}"
-        f"&destination={place_location['lat']},{place_location['lng']}"
-        f"&travelmode=walking"
+    # Формируем ссылку на Яндекс Карты для маршрута
+    maps_url = get_route_url(
+        user_location["latitude"], 
+        user_location["longitude"],
+        place_location["lat"], 
+        place_location["lng"]
     )
     
     query.edit_message_text(
-        f"Маршрут до {selected_place['name']} построен! Нажмите на кнопку ниже, чтобы открыть его в Google Maps:",
+        f"Маршрут до {selected_place['name']} построен! Нажмите на кнопку ниже, чтобы открыть его в Яндекс Картах:",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Открыть маршрут", url=maps_url)],
             [InlineKeyboardButton("Назад", callback_data=f"place_{place_index}")]
@@ -300,21 +306,53 @@ def excursion_handler(update: Update, context: CallbackContext) -> int:
     place_index = int(query.data.split('_')[1])
     selected_place = user_data_store[user_id]["selected_place"]
     
-    # Здесь можно добавить генерацию экскурсии на основе информации о месте
-    # В реальном проекте можно использовать API для получения исторических данных
-    # или интегрировать ChatGPT для генерации интересного текста
+    # Получаем адрес места
+    address = selected_place.get("formatted_address", "")
     
-    excursion_text = (
+    # Генерируем мини-экскурсию с помощью Perplexity API
+    query.edit_message_text("Генерирую мини-экскурсию, пожалуйста, подождите...")
+    excursion_text = get_excursion_info(selected_place['name'], address)
+    
+    # Формируем текст экскурсии
+    full_text = (
         f"<b>Мини-экскурсия по {selected_place['name']}</b>\n\n"
-        f"Это место имеет большую историческую и культурную ценность. "
-        f"Оно было основано много лет назад и с тех пор привлекает множество туристов. "
-        f"Особенно интересны архитектурные особенности и история развития этого места.\n\n"
-        f"В реальной версии здесь будет более подробная и точная информация о выбранном месте, "
-        f"собранная из различных источников или сгенерированная с помощью AI."
+        f"{excursion_text}"
     )
     
     query.edit_message_text(
-        excursion_text,
+        full_text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Назад", callback_data=f"place_{place_index}")]
+        ])
+    )
+    
+    return PLACE_SELECTION
+
+def reviews_handler(update: Update, context: CallbackContext) -> int:
+    """Обработчик запроса на отзывы о месте"""
+    query = update.callback_query
+    query.answer()
+    
+    user_id = query.from_user.id
+    place_index = int(query.data.split('_')[1])
+    selected_place = user_data_store[user_id]["selected_place"]
+    
+    # Получаем адрес места
+    address = selected_place.get("formatted_address", "")
+    
+    # Получаем обзор отзывов с помощью Perplexity API
+    query.edit_message_text("Собираю отзывы, пожалуйста, подождите...")
+    reviews_text = get_place_reviews(selected_place['name'], address)
+    
+    # Формируем текст с отзывами
+    full_text = (
+        f"<b>Отзывы посетителей о {selected_place['name']}</b>\n\n"
+        f"{reviews_text}"
+    )
+    
+    query.edit_message_text(
+        full_text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Назад", callback_data=f"place_{place_index}")]
@@ -404,6 +442,7 @@ def main() -> None:
                 CallbackQueryHandler(place_selection_handler, pattern=r"^place_"),
                 CallbackQueryHandler(route_handler, pattern=r"^route_"),
                 CallbackQueryHandler(excursion_handler, pattern=r"^excursion_"),
+                CallbackQueryHandler(reviews_handler, pattern=r"^reviews_"),
                 CallbackQueryHandler(back_to_places, pattern=r"^back_to_places$"),
                 CallbackQueryHandler(restart, pattern=r"^restart$"),
             ],
